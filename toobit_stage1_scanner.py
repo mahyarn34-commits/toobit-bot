@@ -834,6 +834,9 @@ def _build_symbol_data(client: ToobitClient, symbol: str, market_type: MarketTyp
     candle_age = (datetime.now(timezone.utc) - candles["close_time"].iloc[-1]).total_seconds()
     freshness_reason = data_freshness_check(ob.age_seconds, ob.age_seconds, candle_age)
     if freshness_reason is not None:
+        if freshness_reason == "STALE_CANDLE":
+            bucket = int(candle_age // 60) * 60
+            return None, f"STALE_CANDLE_{bucket}s-{bucket+60}s"
         return None, freshness_reason
 
     price = float(candles["close"].iloc[-1])
