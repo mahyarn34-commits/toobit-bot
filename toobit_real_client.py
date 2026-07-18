@@ -129,7 +129,16 @@ class RealToobitClient(ToobitClient):
             "close": float(k[4]), "volume": float(k[5]),
             "close_time": pd.Timestamp(k[6], unit="ms", tz="UTC"),
         } for k in raw]
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        # Do NOT assume the API returns oldest-first: sort explicitly.
+        # (An unsorted/descending response made close_time.iloc[-1] look
+        # like the OLDEST candle, which made every symbol look stale.)
+        df = df.sort_values("close_time").reset_index(drop=True)
+        # Drop any still-forming candle (close_time in the future) —
+        # Stage-1 spec requires completed candles only.
+        now_ts = pd.Timestamp.now(tz="UTC")
+        df = df[df["close_time"] <= now_ts].reset_index(drop=True)
+        return df
 
     def fetch_orderbook(self, symbol: str) -> OrderbookSnapshot:
         real_symbol = self._real_symbol(symbol)
