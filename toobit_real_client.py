@@ -211,6 +211,90 @@ class RealToobitClient(ToobitClient):
         rows = [{
             "open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
             "close": float(k[4]), "volume": float(k[5]),
+            "close_time": pd.Timestamp(int(float(k[6])), unit="ms", tz="UTC"),
+        } for k in raw]
+        df = pd.DataFrame(rows)
+        # Do NOT assume the API returns oldest-first: sort explicitly.
+        # (An unsorted/descending response made close_time.iloc[-1] look
+        # like the OLDEST candle, which made every symbol look stale.)
+        df = df.sort_values("close_time").reset_index(drop=True)
+        # Drop any still-forming candle (close_time in the future) —
+        # Stage-1 spec requires completed candles only.
+        now_ts = pd.Timestamp.now(tz="UTC")
+        df = df[df["close_time"] <= now_ts].reset_index(drop=True)
+        return df
+
+    def fetch_orderbook(self, symbol: str) -> OrderbookSnapshot:
+        real_symbol = self._real_symbol(symbol)
+        raw = self._get("/quote/v1/depth", {"symbol": real_symbol, "limit": 50})
+        bids = raw.get("b", [])
+        asks = raw.get("a", [])
+
+        bid_price = float(bids[0][0]) if bids else 0.0
+        ask_price = float(asks[0][0]) if asks else 0.0
+        bid_depth = sum(float(q) for _, q in bids)
+        ask_depth = sum(float(q) for _, q in asks)
+
+        server_ms = raw.get("t")
+        age_seconds = max(0.0, (time.time() * 1000 - server_ms) / 1000) if server_ms else 0.0
+
+        return OrderbookSnapshot(
+            bid=bid_price, ask=ask_price,
+            bid_depth=bid_depth, ask_depth=ask_depth,
+            levels_available=min(len(bids), len(asks)),
+            age_seconds=age_seconds,
+        )
+
+    def fetch_funding_and_oi(self, symbol: str) -> tuple[float, pd.Series]:
+        real_symbol = self._real_symbol(symbol)
+
+        funding_raw = self._get("/api/v1/futures/fundingRate", {"symbol": real_symbol})
+        funding_pct = 0.0
+        if funding_raw:
+            entry = funding_raw[0]
+            rate_pct = float(entry["rate"]) * 100
+            period = entry.get("period", "8H")
+            # Normalize to an 8h-equivalent percentage if the settlement
+            # period isn't already 8 hours.
+            try:
+                period_hours = float(period.rstrip("H"))
+                funding_pct = rate_pct * (8.0 / period_hours) if period_hours else rate_pct
+            except (ValueError, ZeroDivisionError):
+                funding_pct = rate_pct
+
+        oi_raw = self._get("/quote/v1/openInterest", {"symbol": real_symbol})
+        oi_list = oi_raw.get("openInterestList", [])
+        current_oi = float(oi_list[0]["size"]) if oi_list else 0.0
+
+        now = time.time()
+        history = self._oi_history.setdefault(real_symbol, [])
+        history.append((now, current_oi))
+        cutoff = now - 2 * 3600  # keep ~2 hours of history
+        self._oi_history[real_symbol] = [(t, v) for t, v in history if t >= cutoff]
+
+        oi_series = pd.Series([v for _, v in self._oi_history[real_symbol]])
+        return funding_pct, oi_series
+    def fetch_candles(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+        real_symbol = self._real_symbol(symbol)
+        limit = min(limit, 1000)  # TOOBIT max per request is 1000
+
+        # IMPORTANT: TOOBIT's /quote/v1/klines returns ONLY the single
+        # latest candle if startTime/endTime are omitted. We must supply
+        # an explicit window to get a real history.
+        interval_ms = self._INTERVAL_MS.get(timeframe, 300_000)
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - limit * interval_ms
+
+        raw = self._get("/quote/v1/klines", {
+            "symbol": real_symbol,
+            "interval": timeframe,
+            "startTime": start_ms,
+            "endTime": end_ms,
+            "limit": limit,
+        })
+        rows = [{
+            "open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
+            "close": float(k[4]), "volume": float(k[5]),
             "close_time": pd.Timestamp(k[6], unit="ms", tz="UTC"),
         } for k in raw]
         df = pd.DataFrame(rows)
