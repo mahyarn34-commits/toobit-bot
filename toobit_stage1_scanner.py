@@ -1,111 +1,195 @@
 """
-TOOBIT STAGE 1 MARKET SCANNER — v11.0 (Python implementation)
-==============================================================
+REAL TOOBIT API CLIENT
+=======================
+Implements toobit_stage1_scanner.ToobitClient against the real, documented
+TOOBIT REST API (https://api-docs.toobit.com/).
 
-Converts the "Stage 1" prompt spec into real, testable code: market
-discovery, filtering, liquidity/orderbook/trend/momentum/volatility
-scoring, BTC regime analysis, risk penalties, and final ranking.
-
-NO signal generation happens here (no buy/sell/entry/SL/TP/direction) —
-that is Stage 2's job, deliberately kept out of this file.
-
------------------------------------------------------------------
-WHAT YOU MUST FILL IN
------------------------------------------------------------------
-This file has NO network access baked in. The four functions in the
-`ToobitClient` class (fetch_active_markets, fetch_candles,
-fetch_orderbook, fetch_funding_and_oi) are stubs — wire them to the
-real TOOBIT REST/WebSocket endpoints. Everything downstream (all
-scoring/filtering/ranking) is fully implemented and testable today
-with synthetic data (see `if __name__ == "__main__"` at the bottom).
+Endpoints used (all public, no API key needed for these):
+- GET /api/v1/exchangeInfo          -> symbol/contract list + status
+- GET /quote/v1/klines              -> candles
+- GET /quote/v1/depth               -> order book snapshot
+- GET /api/v1/futures/fundingRate   -> funding rate (perpetual only)
+- GET /quote/v1/openInterest        -> current open interest (perpetual only)
 
 -----------------------------------------------------------------
-BUGS FIXED / AMBIGUITIES RESOLVED vs. the v10.0 text prompt
+IMPORTANT CAVEAT — Open Interest history
 -----------------------------------------------------------------
-1. Small-market liquidity rule (was self-contradictory: "skip bands,
-   rank directly" vs "use Top25/Middle/Bottom25"). Resolved: if
-   total_symbols >= 20 -> 5-band percentile scoring; else -> collapsed
-   3-band (Top25/Middle/Bottom25-remove) + LOW_MARKET_QUALITY flag.
-   See `liquidity_score()`.
+TOOBIT's public REST API only exposes the CURRENT open interest value,
+not a historical time series. The Stage-1 spec needs a 20-period
+lookback to compute OI change % and the OI-spike z-score.
 
-2. BTC adjustment undefined when a symbol has NO trend structure
-   (trend_score == 0) while BTC is BULLISH/BEARISH. Resolved: treated
-   as neutral (0 adjustment) — there's no structure to be "aligned" or
-   "opposite" to. See `btc_adjustment()`.
+Fix used here: this client keeps its own small in-memory rolling
+history per symbol, appending one point every time /scan calls it.
+This means:
+- Right after your bot starts, OI-based scoring will be flat/neutral
+  (not enough history yet).
+- After ~1.5-2 hours of periodic /scan calls (or once you add
+  scheduled polling), the OI trend becomes meaningful.
+- Restarting the bot process resets this history (it is NOT persisted
+  to disk). If you need it to survive restarts, write self._oi_history
+  to a small JSON/SQLite file instead of keeping it only in memory.
 
-3. MACD histogram % change formula divides by abs(previous), which is
-   a ZeroDivisionError whenever the previous histogram value is
-   exactly 0 (common at zero-line crossovers). Resolved: special-cased
-   -- when previous == 0, classify by sign of current value directly
-   instead of a percentage change. See `macd_histogram_score()`.
-
-4. ATR% formula: the v10.0 text used ATR14/EMA50, differing from the
-   earlier (and standard) ATR14/Price. Kept as ATR14/Price (the
-   standard definition) since dividing by EMA50 looked like an
-   accidental substitution, not a deliberate change. Flagged with a
-   constant `ATR_PERCENT_DENOMINATOR` so you can flip it in one place
-   if EMA50 was actually intended.
-
-5. Open Interest score had undefined cases ("OI increasing + price
-   decreasing", "OI flat"). Resolved: both score 0 (no bullish
-   confirmation) explicitly, rather than silently falling through.
-   See `open_interest_score()`.
-
-6. Extreme-funding flag thresholds are asymmetric in every version of
-   this prompt (-0.05% vs +0.08%). Left asymmetric but pulled into
-   named constants (`EXTREME_NEG_FUNDING_THRESHOLD`,
-   `EXTREME_POS_FUNDING_THRESHOLD`) — change both to the same
-   magnitude if symmetry was actually intended.
-
-7. Score caps (v10.0 claimed SPOT max=25, PERPETUAL max=27) were off
-   by one: they omitted the max +1 BTC adjustment. This file does NOT
-   hardcode a cap number at all — `max_theoretical_score()` computes
-   it from the actual component maxima, so it can never drift out of
-   sync with the scoring logic again.
-
-8. `ema_state` was referenced in the v10.0 output schema but never
-   defined. Resolved: "bullish" if EMA50 > EMA200, "bearish" if
-   EMA50 < EMA200, "neutral" if within the no-trend band.
-
-9. The v10.0 prompt text was truncated mid-schema (Part 4/4 cuts off
-   inside the PERPETUAL result object). This file's OUTPUT_SCHEMA_KEYS
-   / build_result_object() gives the complete, closed structure.
+-----------------------------------------------------------------
+SYMBOL NORMALIZATION
+-----------------------------------------------------------------
+- Spot symbols from TOOBIT are already in the scanner's expected
+  format (e.g. "ETHUSDT") -> used as-is.
+- Perpetual symbols from TOOBIT look like "BTC-SWAP-USDT" (linear) or
+  "BTC-SWAP" (inverse, EXCLUDED per Stage-1 spec: no inverse contracts).
+  This client normalizes them to "<BASE>USDT_PERP" (e.g. "BTCUSDT_PERP")
+  using the contract's "index" field, and keeps an internal map back
+  to the real TOOBIT symbol string for actual API calls.
 """
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Literal, Optional
+import time
+from typing import Optional
 
-import numpy as np
 import pandas as pd
+import requests
 
-# ==================================================================
-# CONFIG / THRESHOLDS  (all magic numbers live here, nowhere else)
-# ==================================================================
+from toobit_stage1_scanner import ToobitClient, OrderbookSnapshot, MarketType
 
-MIN_CANDLES = 1000
-BTC_MIN_15M_CANDLES = 500
+BASE_URL = "https://api.toobit.com"
+REQUEST_TIMEOUT_SEC = 10
 
-MAX_MISSING_CANDLE_PCT = 1.0          # %
-MAX_CONSECUTIVE_MISSING = 3
 
-MAX_ORDERBOOK_DELAY_SEC = 3
-MAX_TICKER_DELAY_SEC = 5
-MAX_CANDLE_DELAY_SEC = 300            # 5 minutes
+class RealToobitClient(ToobitClient):
+    def __init__(self):
+        self.session = requests.Session()
+        self._perp_symbol_map: dict[str, str] = {}   # normalized -> real TOOBIT symbol
+        self._oi_history: dict[str, list[tuple[float, float]]] = {}  # real symbol -> [(ts, oi)]
 
-ORDERBOOK_DEPTH_LEVELS = 50
-ORDERBOOK_DEPTH_RANGE_PCT = 2.0
-ORDERBOOK_MIN_LEVELS_TO_KEEP = 10
+    # ---------------------------------------------------------------
+    # low-level helper
+    # ---------------------------------------------------------------
+    def _get(self, path: str, params: Optional[dict] = None) -> dict | list:
+        resp = self.session.get(f"{BASE_URL}{path}", params=params, timeout=REQUEST_TIMEOUT_SEC)
+        resp.raise_for_status()
+        return resp.json()
 
-RSI_REMOVE_HIGH = 85
-RSI_REMOVE_LOW = 15
+    def _real_symbol(self, symbol: str) -> str:
+        return self._perp_symbol_map.get(symbol, symbol)
 
-ATR_PERCENT_MIN = 0.08                # % — below this, symbol removed
-ATR_PERCENT_DENOMINATOR = "price"     # "price" (standard) or "ema50"
+    # ---------------------------------------------------------------
+    # ToobitClient interface
+    # ---------------------------------------------------------------
+    def fetch_active_markets(self, market_type: MarketType) -> list[str]:
+        data = self._get("/api/v1/exchangeInfo")
 
+        if market_type == "SPOT":
+            return [
+                s["symbol"] for s in data.get("symbols", [])
+                if s.get("status") == "TRADING"
+            ]
+
+        # PERPETUAL
+        out = []
+        self._perp_symbol_map = {}
+        for c in data.get("contracts", []):
+            if c.get("status") != "TRADING":
+                continue
+            if c.get("inverse"):
+                continue  # exclude inverse contracts, per Stage-1 removal rules
+            base_pair = c.get("index") or c["symbol"]     # e.g. "BTCUSDT"
+            normalized = f"{base_pair}_PERP"
+            self._perp_symbol_map[normalized] = c["symbol"]  # e.g. "BTC-SWAP-USDT"
+            out.append(normalized)
+        return out
+
+    # milliseconds per candle for each supported interval
+    _INTERVAL_MS = {
+        "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+        "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
+        "6h": 21_600_000, "8h": 28_800_000, "12h": 43_200_000,
+        "1d": 86_400_000, "1w": 604_800_000,
+    }
+
+    def fetch_candles(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+        real_symbol = self._real_symbol(symbol)
+        limit = min(limit, 1000)  # TOOBIT max per request is 1000
+
+        # IMPORTANT: TOOBIT's /quote/v1/klines returns ONLY the single
+        # latest candle if startTime/endTime are omitted. We must supply
+        # an explicit window to get a real history.
+        interval_ms = self._INTERVAL_MS.get(timeframe, 300_000)
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - limit * interval_ms
+
+        raw = self._get("/quote/v1/klines", {
+            "symbol": real_symbol,
+            "interval": timeframe,
+            "startTime": start_ms,
+            "endTime": end_ms,
+            "limit": limit,
+        })
+        rows = [{
+            "open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
+            "close": float(k[4]), "volume": float(k[5]),
+            "close_time": pd.Timestamp(int(float(k[6])), unit="ms", tz="UTC"),
+        } for k in raw]
+        df = pd.DataFrame(rows)
+        # Do NOT assume the API returns oldest-first: sort explicitly.
+        # (An unsorted/descending response made close_time.iloc[-1] look
+        # like the OLDEST candle, which made every symbol look stale.)
+        df = df.sort_values("close_time").reset_index(drop=True)
+        # Drop any still-forming candle (close_time in the future) —
+        # Stage-1 spec requires completed candles only.
+        now_ts = pd.Timestamp.now(tz="UTC")
+        df = df[df["close_time"] <= now_ts].reset_index(drop=True)
+        return df
+
+    def fetch_orderbook(self, symbol: str) -> OrderbookSnapshot:
+        real_symbol = self._real_symbol(symbol)
+        raw = self._get("/quote/v1/depth", {"symbol": real_symbol, "limit": 50})
+        bids = raw.get("b", [])
+        asks = raw.get("a", [])
+
+        bid_price = float(bids[0][0]) if bids else 0.0
+        ask_price = float(asks[0][0]) if asks else 0.0
+        bid_depth = sum(float(q) for _, q in bids)
+        ask_depth = sum(float(q) for _, q in asks)
+
+        server_ms = raw.get("t")
+        age_seconds = max(0.0, (time.time() * 1000 - server_ms) / 1000) if server_ms else 0.0
+
+        return OrderbookSnapshot(
+            bid=bid_price, ask=ask_price,
+            bid_depth=bid_depth, ask_depth=ask_depth,
+            levels_available=min(len(bids), len(asks)),
+            age_seconds=age_seconds,
+        )
+
+    def fetch_funding_and_oi(self, symbol: str) -> tuple[float, pd.Series]:
+        real_symbol = self._real_symbol(symbol)
+
+        funding_raw = self._get("/api/v1/futures/fundingRate", {"symbol": real_symbol})
+        funding_pct = 0.0
+        if funding_raw:
+            entry = funding_raw[0]
+            rate_pct = float(entry["rate"]) * 100
+            period = entry.get("period", "8H")
+            # Normalize to an 8h-equivalent percentage if the settlement
+            # period isn't already 8 hours.
+            try:
+                period_hours = float(period.rstrip("H"))
+                funding_pct = rate_pct * (8.0 / period_hours) if period_hours else rate_pct
+            except (ValueError, ZeroDivisionError):
+                funding_pct = rate_pct
+
+        oi_raw = self._get("/quote/v1/openInterest", {"symbol": real_symbol})
+        oi_list = oi_raw.get("openInterestList", [])
+        current_oi = float(oi_list[0]["size"]) if oi_list else 0.0
+
+        now = time.time()
+        history = self._oi_history.setdefault(real_symbol, [])
+        history.append((now, current_oi))
+        cutoff = now - 2 * 3600  # keep ~2 hours of history
+        self._oi_history[real_symbol] = [(t, v) for t, v in history if t >= cutoff]
+
+        oi_series = pd.Series([v for _, v in self._oi_history[real_symbol]])
+        return funding_pct, oi_series
 EXTREME_NEG_FUNDING_THRESHOLD = -0.05   # %
 EXTREME_POS_FUNDING_THRESHOLD = 0.08    # %
 # NOTE: intentionally asymmetric per source prompt — see docstring #6.
